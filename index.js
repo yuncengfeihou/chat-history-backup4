@@ -648,9 +648,20 @@ async function performManualBackup() {
 
 // --- 恢复逻辑 ---
 async function restoreBackup(backupData) {
+    console.log('[聊天自动备份] 开始恢复备份:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
+    const initialContext = getContext(); // 获取初始上下文
+    const isGroup = backupData.chatKey.startsWith('group_');
+
+    // --- 确保下面这行存在且未被注释 ---
+    const entityIdMatch = backupData.chatKey.match(isGroup ? /group_(\w+)_/ : /char_(.+?)_/);
+    // --- 结束确保 ---
+
+    // 现在可以安全地使用 entityIdMatch 了
     let entityId = entityIdMatch ? entityIdMatch[1] : null;
 
     if (!entityId) {
+        console.error('[聊天自动备份] 无法从备份数据中提取角色/群组ID:', backupData.chatKey);
+        toastr.error('无法识别备份对应的角色/群组ID');
         return false;
     }
 
@@ -663,7 +674,6 @@ async function restoreBackup(backupData) {
                 logDebug(`切换到群组: ${entityId}`);
                 await select_group_chats(entityId); // 使用导入的函数
             } else {
-                // --- 修改开始 ---
                 // entityId 现在是字符索引的字符串形式，例如 "0", "1", "5"
                 const charIndex = parseInt(entityId, 10); // 将字符串索引转换为数字
 
@@ -683,12 +693,14 @@ async function restoreBackup(backupData) {
             // 等待状态更新
             await new Promise(resolve => setTimeout(resolve, 500));
         } catch (switchError) {
+            console.error('[聊天自动备份] 切换角色/群组失败:', switchError);
+            const errorMsg = switchError instanceof Error ? switchError.message : String(switchError);
+            toastr.error(`切换到 ${isGroup ? '群组' : '角色'} ${entityId} 失败: ${errorMsg}`);
             return false;
         }
 
         // 2. 创建新聊天
-        // ... 使用 doNewChat ...
-         try {
+        try {
             logDebug('创建新的聊天');
             await doNewChat({ deleteCurrentChat: false }); // 使用导入的函数
             await new Promise(resolve => setTimeout(resolve, 800));
@@ -717,46 +729,47 @@ async function restoreBackup(backupData) {
         }
         logDebug(`上下文已确认: ${currentRestoredKey}`);
 
-
         // 4. 恢复聊天内容
         logDebug('开始恢复聊天消息, 数量:', backupData.chat.length);
-        if (!newContext.chat) { /*...*/ return false; }
-        newContext.chat.length = 0;
-        const copiedChatData = structuredClone(backupData.chat);
-        copiedChatData.forEach(msg => newContext.chat.push(msg));
+        if (!newContext.chat) {
+            console.error('[聊天自动备份] 恢复错误：新的上下文中找不到 chat 数组！');
+            toastr.error('恢复聊天内容失败：内部状态错误');
+            return false;
+        }
+        newContext.chat.length = 0; // 清空当前（新创建的）聊天
+        const copiedChatData = structuredClone(backupData.chat); // 使用 structuredClone
+        copiedChatData.forEach(msg => newContext.chat.push(msg)); // 填充备份的消息
         logDebug(`聊天内容已恢复到 newContext.chat, 长度: ${newContext.chat.length}`);
 
         // 5. 恢复元数据
-        // ... (恢复元数据的代码保持不变，使用 updateChatMetadata) ...
         if (backupData.metadata) {
             logDebug('恢复聊天元数据:', backupData.metadata);
-            updateChatMetadata(structuredClone(backupData.metadata), true);
+            updateChatMetadata(structuredClone(backupData.metadata), true); // true 表示重置/覆盖
             logDebug('聊天元数据已应用');
         } else {
             logDebug('无元数据需要恢复');
         }
 
         // 6. 显式更新 UI
-        // ... (更新 UI 的代码保持不变，使用 printMessages, scrollChatToBottom) ...
         logDebug('开始更新聊天界面UI');
-        await printMessages();
-        scrollChatToBottom();
+        await printMessages(); // 重新渲染聊天记录
+        scrollChatToBottom(); // 滚动到底部
         logDebug('聊天界面UI已更新');
 
-        // 7. 保存恢复的聊天
-        // ... (保存聊天的代码保持不变，使用 saveChatConditional) ...
+        // 7. 保存恢复的聊天状态
         logDebug('保存恢复后的聊天状态');
-        await saveChatConditional();
+        await saveChatConditional(); // 调用导入的函数
         logDebug('聊天状态已保存');
 
         // 8. 触发其他相关事件
-        eventSource.emit(event_types.CHAT_CHANGED, newContext.chatId);
+        eventSource.emit(event_types.CHAT_CHANGED, newContext.chatId); // 通知聊天已改变
 
         console.log('[聊天自动备份] 聊天恢复成功');
-        toastr.success('聊天记录已成功恢复到新聊天');
+        toastr.success('聊天记录已成功恢复到新聊天'); // 添加成功提示
         return true;
 
     } catch (error) {
+        // 最终错误处理
         console.error('[聊天自动备份] 恢复聊天过程中发生严重错误:', error);
         toastr.error(`恢复失败: ${error.message || '未知错误'}`, '聊天自动备份');
         return false;
