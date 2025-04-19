@@ -1,0 +1,11 @@
+{
+    "display_name": "Chat History Backup5.2",
+    "loading_order": 5,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Your Name",
+    "version": "1.0.0",
+    "homePage": ""
+}
