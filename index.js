@@ -274,7 +274,7 @@ async function getAllBackupKeys() {
         console.error('[聊天自动备份] getAllBackupKeys 失败:', error);
         return []; // 出错时返回空数组
     }
-
+} 
 
 // 从 IndexedDB 删除指定备份 (优化版本)
 async function deleteBackup(chatKey, timestamp) {
