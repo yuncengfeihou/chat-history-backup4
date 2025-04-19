@@ -33,7 +33,7 @@ import {
     // --- 群组相关函数 ---
     select_group_chats,     // 用于选择群组聊天
     // getGroupChat, // 可能不需要，select_group_chats 应该会处理
-} from './group-chats.js'; 
+} from '../../../group-chats.js';
 
 // 扩展名和设置初始化
 const PLUGIN_NAME = 'chat-history-backup4';
