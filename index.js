@@ -18,7 +18,7 @@ import {
 } from '../../../../script.js';
 
 // 扩展名和设置初始化
-const PLUGIN_NAME = 'chat-history-backup3';
+const PLUGIN_NAME = 'chat-history-backup4';
 const DEFAULT_SETTINGS = {
     maxTotalBackups: 3,        // 整个系统保留的最大备份数量
     backupDebounceDelay: 1000, // 防抖延迟时间 (毫秒)
@@ -242,6 +242,40 @@ async function getAllBackups() {
     }
 }
 
+// 从 IndexedDB 获取所有备份的主键 (优化清理逻辑)
+async function getAllBackupKeys() {
+    const db = await getDB();
+    try {
+        return await new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readonly');
+
+            transaction.onerror = (event) => {
+                console.error('[聊天自动备份] 获取所有备份键事务失败:', event.target.error);
+                reject(event.target.error);
+            };
+
+            const store = transaction.objectStore(STORE_NAME);
+            // 使用 getAllKeys() 只获取主键
+            const request = store.getAllKeys();
+
+            request.onsuccess = () => {
+                // 返回的是键的数组，每个键是 [chatKey, timestamp]
+                const keys = request.result || [];
+                logDebug(`从IndexedDB获取了总共 ${keys.length} 个备份的主键`);
+                resolve(keys);
+            };
+
+            request.onerror = (event) => {
+                console.error('[聊天自动备份] 获取所有备份键失败:', event.target.error);
+                reject(event.target.error);
+            };
+        });
+    } catch (error) {
+        console.error('[聊天自动备份] getAllBackupKeys 失败:', error);
+        return []; // 出错时返回空数组
+    }
+
+
 // 从 IndexedDB 删除指定备份 (优化版本)
 async function deleteBackup(chatKey, timestamp) {
     const db = await getDB();
@@ -348,7 +382,7 @@ async function executeBackupLogic(settings) {
     const chatKey = getCurrentChatKey();
     if (!chatKey) {
         console.warn('[聊天自动备份] 无有效的聊天标识符，取消备份');
-        return false;
+        return false; // 返回 false 表示备份未执行
     }
 
     const context = getContext();
@@ -356,7 +390,7 @@ async function executeBackupLogic(settings) {
 
     if (!chat || chat.length === 0) {
         logDebug('聊天记录为空，取消备份');
-        return false;
+        return false; // 返回 false 表示备份未执行
     }
 
     const { entityName, chatName } = getCurrentChatInfo();
@@ -367,15 +401,56 @@ async function executeBackupLogic(settings) {
     logDebug(`准备备份聊天: ${entityName} - ${chatName}, 消息数: ${chat.length}, 最后消息ID: ${lastMsgIndex}`);
 
     try {
-        // 2. 使用 Worker 进行深拷贝
-        console.time('[聊天自动备份] Web Worker 深拷贝时间');
-        logDebug('请求 Worker 执行深拷贝...');
-        const { chat: copiedChat, metadata: copiedMetadata } = await performDeepCopyInWorker(chat, chat_metadata);
-        console.timeEnd('[聊天自动备份] Web Worker 深拷贝时间');
-        logDebug('从 Worker 收到拷贝后的数据');
+        // 2. 使用 Worker 进行深拷贝 (或者主线程回退，如果Worker失败)
+        let copiedChat, copiedMetadata;
+        if (backupWorker) {
+            try {
+                console.time('[聊天自动备份] Web Worker 深拷贝时间');
+                logDebug('请求 Worker 执行深拷贝...');
+                const result = await performDeepCopyInWorker(chat, chat_metadata);
+                copiedChat = result.chat;
+                copiedMetadata = result.metadata;
+                console.timeEnd('[聊天自动备份] Web Worker 深拷贝时间');
+                logDebug('从 Worker 收到拷贝后的数据');
+            } catch(workerError) {
+                 console.error('[聊天自动备份] Worker 深拷贝失败，将尝试在主线程执行:', workerError);
+                 // Worker失败，尝试主线程回退（如果需要）
+                 console.time('[聊天自动备份] 主线程深拷贝时间 (Worker失败后)');
+                 try {
+                     copiedChat = structuredClone(chat);
+                     copiedMetadata = structuredClone(chat_metadata);
+                 } catch (structuredCloneError) {
+                    try {
+                        copiedChat = JSON.parse(JSON.stringify(chat));
+                        copiedMetadata = JSON.parse(JSON.stringify(chat_metadata));
+                    } catch (jsonError) {
+                        console.error('[聊天自动备份] 主线程深拷贝也失败:', jsonError);
+                        throw new Error("无法完成聊天数据的深拷贝"); // 抛出错误终止备份
+                    }
+                 }
+                 console.timeEnd('[聊天自动备份] 主线程深拷贝时间 (Worker失败后)');
+            }
+        } else {
+            // Worker 不可用，直接在主线程执行
+            console.time('[聊天自动备份] 主线程深拷贝时间 (无Worker)');
+            try {
+                 copiedChat = structuredClone(chat);
+                 copiedMetadata = structuredClone(chat_metadata);
+             } catch (structuredCloneError) {
+                try {
+                    copiedChat = JSON.parse(JSON.stringify(chat));
+                    copiedMetadata = JSON.parse(JSON.stringify(chat_metadata));
+                } catch (jsonError) {
+                    console.error('[聊天自动备份] 主线程深拷贝失败:', jsonError);
+                    throw new Error("无法完成聊天数据的深拷贝"); // 抛出错误终止备份
+                }
+             }
+            console.timeEnd('[聊天自动备份] 主线程深拷贝时间 (无Worker)');
+        }
+
 
         if (!copiedChat) {
-             throw new Error("Worker 未返回有效的聊天数据副本");
+             throw new Error("未能获取有效的聊天数据副本");
         }
 
         // 3. 构建备份对象
@@ -390,59 +465,83 @@ async function executeBackupLogic(settings) {
             metadata: copiedMetadata || {}
         };
 
-        // 4. 检查当前聊天是否已有备份
-        const existingBackups = await getBackupsForChat(chatKey);
-        
-        // 5. 检查重复并处理
+        // 4. 检查当前聊天是否已有基于最后消息ID的备份 (避免完全相同的备份)
+        const existingBackups = await getBackupsForChat(chatKey); // 获取当前聊天的备份
+
+        // 5. 检查重复并处理 (基于 lastMessageId)
         const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex);
         let needsSave = true;
 
         if (existingBackupIndex !== -1) {
-             // 比较时间戳，仅当新备份更新时才替换
-            if (backup.timestamp > existingBackups[existingBackupIndex].timestamp) {
-                logDebug(`发现具有相同最后消息ID (${lastMsgIndex}) 的旧备份，将删除旧备份`);
-                await deleteBackup(chatKey, existingBackups[existingBackupIndex].timestamp);
-                existingBackups.splice(existingBackupIndex, 1); // 从列表中移除旧备份
+             // 如果找到相同 lastMessageId 的备份
+            const existingTimestamp = existingBackups[existingBackupIndex].timestamp;
+            if (backup.timestamp > existingTimestamp) {
+                // 新备份更新，删除旧的同 ID 备份
+                logDebug(`发现具有相同最后消息ID (${lastMsgIndex}) 的旧备份 (时间戳 ${existingTimestamp})，将删除旧备份以便保存新备份 (时间戳 ${backup.timestamp})`);
+                await deleteBackup(chatKey, existingTimestamp);
+                // 注意：不需要从 existingBackups 数组中 splice，因为它不再用于全局清理
             } else {
-                logDebug(`发现具有相同最后消息ID (${lastMsgIndex}) 且时间戳更新或相同的备份，跳过本次保存`);
+                // 旧备份更新或相同，跳过本次保存
+                logDebug(`发现具有相同最后消息ID (${lastMsgIndex}) 且时间戳更新或相同的备份 (时间戳 ${existingTimestamp} vs ${backup.timestamp})，跳过本次保存`);
                 needsSave = false;
             }
         }
 
         if (!needsSave) {
+            logDebug('备份已存在或无需更新 (基于lastMessageId和时间戳比较)，跳过保存和全局清理步骤');
             return false; // 不需要保存，返回 false
         }
 
         // 6. 保存新备份到 IndexedDB
         await saveBackupToDB(backup);
-        
-        // 7. 获取所有备份并限制总数量（关键修改点）
-        logDebug(`获取所有备份，限制总数量为 ${settings.maxTotalBackups}`);
-        const allBackups = await getAllBackups();
-        allBackups.sort((a, b) => b.timestamp - a.timestamp); // 按时间降序排序
-        
-        if (allBackups.length > settings.maxTotalBackups) {
-            const backupsToDelete = allBackups.slice(settings.maxTotalBackups);
-            logDebug(`总备份数 (${allBackups.length}) 超出系统限制 (${settings.maxTotalBackups})，将删除 ${backupsToDelete.length} 个旧备份`);
-            
-            // 使用Promise.all并行删除，提高效率
-            await Promise.all(backupsToDelete.map(oldBackup => {
-                logDebug(`删除旧备份: ${oldBackup.entityName} - ${oldBackup.chatName}, 时间 ${new Date(oldBackup.timestamp).toLocaleString()}`);
-                return deleteBackup(oldBackup.chatKey, oldBackup.timestamp);
+        logDebug(`新备份已保存: [${chatKey}, ${backup.timestamp}]`);
+
+        // --- 优化后的清理逻辑 ---
+        // 7. 获取所有备份的 *主键* 并限制总数量
+        logDebug(`获取所有备份的主键，以检查是否超出系统限制 (${settings.maxTotalBackups})`);
+        const allBackupKeys = await getAllBackupKeys(); // 调用新函数，只获取键
+
+        if (allBackupKeys.length > settings.maxTotalBackups) {
+            logDebug(`总备份数 (${allBackupKeys.length}) 超出系统限制 (${settings.maxTotalBackups})`);
+
+            // 按时间戳升序排序键 (key[1] 是 timestamp)
+            // 这样最旧的备份的键会排在数组前面
+            allBackupKeys.sort((a, b) => a[1] - b[1]); // a[1] = timestamp, b[1] = timestamp
+
+            const numToDelete = allBackupKeys.length - settings.maxTotalBackups;
+            // 获取数组开头的 numToDelete 个键，这些是需要删除的最旧备份的键
+            const keysToDelete = allBackupKeys.slice(0, numToDelete);
+
+            logDebug(`准备删除 ${keysToDelete.length} 个最旧的备份 (基于键)`);
+
+            // 使用Promise.all并行删除
+            await Promise.all(keysToDelete.map(key => {
+                const oldChatKey = key[0];
+                const oldTimestamp = key[1];
+                logDebug(`删除旧备份 (基于键): chatKey=${oldChatKey}, timestamp=${new Date(oldTimestamp).toLocaleString()}`);
+                // 调用 deleteBackup，它接受 chatKey 和 timestamp
+                return deleteBackup(oldChatKey, oldTimestamp);
             }));
+            logDebug(`${keysToDelete.length} 个旧备份已删除`);
+        } else {
+            logDebug(`总备份数 (${allBackupKeys.length}) 未超出限制 (${settings.maxTotalBackups})，无需清理`);
         }
+        // --- 清理逻辑结束 ---
 
         // 8. UI提示
         if (settings.debug) {
+            // 只有成功保存了新备份才提示
             toastr.info(`已备份聊天: ${entityName} (${lastMsgIndex + 1}条消息)`, '聊天自动备份');
         }
-        logDebug(`成功完成聊天备份: ${entityName} - ${chatName}`);
+        logDebug(`成功完成聊天备份及可能的清理: ${entityName} - ${chatName}`);
 
-        return true; // 表示备份成功
+        return true; // 表示备份成功（或已跳过但无错误）
+
     } catch (error) {
-        console.error('[聊天自动备份] 备份过程中发生严重错误:', error);
-        toastr.error(`备份失败: ${error.message}`, '聊天自动备份');
-        throw error;
+        console.error('[聊天自动备份] 备份或清理过程中发生严重错误:', error);
+        toastr.error(`备份失败: ${error.message || '未知错误'}`, '聊天自动备份');
+        // 返回 false 表示备份/清理操作失败
+        return false;
     }
 }
 
