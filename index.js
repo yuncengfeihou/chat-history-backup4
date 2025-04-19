@@ -18,7 +18,7 @@ import {
 } from '../../../../script.js';
 
 // 扩展名和设置初始化
-const PLUGIN_NAME = 'chat-history-backup3';
+const PLUGIN_NAME = 'chat-history-backup4';
 const DEFAULT_SETTINGS = {
     maxTotalBackups: 3,        // 整个系统保留的最大备份数量
     backupDebounceDelay: 1000, // 防抖延迟时间 (毫秒)
